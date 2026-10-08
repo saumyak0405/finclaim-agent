@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import time
 import urllib.error
@@ -26,7 +27,8 @@ class LLMError(RuntimeError):
 class LLM(Protocol):
     name: str
 
-    def complete(self, messages: list[Message], *, temperature: float = 0.0, max_tokens: int = 1200) -> str: ...
+    def complete(self, messages: list[Message], *, temperature: float = 0.0, max_tokens: int = 4096,
+                 tools: list[dict[str, Any]] | None = None) -> str: ...
 
 
 @dataclass
@@ -35,13 +37,28 @@ class OpenAICompatClient:
     model: str
     api_key: str | None = None
     timeout: float = 60.0
-    max_retries: int = 3
+    max_retries: int = 6
+    max_backoff_s: float = 60.0
     name: str = "openai-compat"
 
-    def complete(self, messages: list[Message], *, temperature: float = 0.0, max_tokens: int = 1200) -> str:
-        body = json.dumps({"model": self.model, "messages": messages,
-                           "temperature": temperature, "max_tokens": max_tokens}).encode()
-        headers = {"Content-Type": "application/json"}
+    def complete(self, messages: list[Message], *, temperature: float = 0.0, max_tokens: int = 4096,
+                 tools: list[dict[str, Any]] | None = None) -> str:
+        """Return the model's reply as text.
+
+        With `tools`, the request uses native function calling with tool_choice=required and the
+        chosen call is returned as a JSON action string, so callers never see the wire format.
+        Reasoning models (e.g. gpt-oss) sometimes emit a native tool call even when no tools were
+        declared; Groq rejects that with 400 tool_use_failed but includes the attempted call, which
+        is recovered here instead of failing the run.
+        """
+        payload: dict[str, Any] = {"model": self.model, "messages": messages,
+                                   "temperature": temperature, "max_tokens": max_tokens}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "required"
+        body = json.dumps(payload).encode()
+        # explicit UA: Groq's Cloudflare front door rejects the default Python-urllib agent (error 1010)
+        headers = {"Content-Type": "application/json", "User-Agent": "finclaim-agent/0.1"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         url = self.base_url.rstrip("/") + "/chat/completions"
@@ -51,15 +68,79 @@ class OpenAICompatClient:
                 req = urllib.request.Request(url, data=body, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     data = json.loads(resp.read())
-                return data["choices"][0]["message"]["content"] or ""
+                msg = data["choices"][0]["message"]
+                if msg.get("tool_calls"):
+                    return tool_call_to_action(msg["tool_calls"][0].get("function", {}), msg.get("content"))
+                return msg.get("content") or ""
             except urllib.error.HTTPError as e:  # 429 / 5xx are retryable
                 last = e
+                detail = e.read()
+                if e.code == 400:
+                    recovered = recover_failed_generation(detail)
+                    if recovered is not None:
+                        return recovered
                 if e.code not in (408, 429, 500, 502, 503, 504):
-                    raise LLMError(f"{self.name}: HTTP {e.code}: {e.read()[:300]!r}") from e
-            except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as e:
-                last = e
-            time.sleep(min(2 ** attempt, 8))
+                    raise LLMError(f"{self.name}: HTTP {e.code}: {detail[:300]!r}") from e
+                wait = retry_after_seconds(e.headers)
+            except (urllib.error.URLError, TimeoutError, KeyError, IndexError, json.JSONDecodeError) as e:
+                last, wait = e, None
+            if attempt < self.max_retries - 1:
+                # per-minute rate limits need real waits: honour the server's hint, else exponential backoff
+                backoff = min(2 ** attempt, self.max_backoff_s)
+                time.sleep(min(max(wait or 0.0, backoff), self.max_backoff_s) + random.uniform(0, 0.5))
         raise LLMError(f"{self.name}: failed after {self.max_retries} attempts: {last}")
+
+
+def retry_after_seconds(headers: Any) -> float | None:
+    """Seconds to wait from Retry-After or Groq's x-ratelimit-reset-* headers ('7.66s', '1m2.5s', '450ms')."""
+    if headers is None:
+        return None
+    for key in ("retry-after", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+        val = headers.get(key)
+        if not val:
+            continue
+        try:
+            return float(val)
+        except ValueError:
+            pass
+        total, found = 0.0, False
+        for num, unit in re.findall(r"([\d.]+)(ms|h|m|s)", val):
+            total += float(num) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
+            found = True
+        if found:
+            return total
+    return None
+
+
+def tool_call_to_action(fn: dict[str, Any], content: str | None = None) -> str:
+    """Native tool call -> the agent's JSON action text. Namespaces like 'functions.' are stripped."""
+    name = str(fn.get("name", "")).split(".")[-1]
+    raw = fn.get("arguments", {})
+    if isinstance(raw, str):
+        try:
+            args = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            args = {"_unparsed": raw}
+    else:
+        args = raw
+    return json.dumps({"thought": (content or "").strip()[:500], "action": "call_tool", "tool": name, "args": args})
+
+
+def recover_failed_generation(body: bytes) -> str | None:
+    try:
+        err = json.loads(body).get("error", {})
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if err.get("code") != "tool_use_failed" or not err.get("failed_generation"):
+        return None
+    gen = err["failed_generation"]
+    try:
+        obj = json.loads(gen)
+    except json.JSONDecodeError:
+        return gen
+    if isinstance(obj, dict) and "name" in obj:
+        return tool_call_to_action({"name": obj["name"], "arguments": obj.get("arguments", obj.get("parameters", {}))})
+    return gen
 
 
 @dataclass
@@ -97,7 +178,7 @@ class ScriptedLLM:
         return self.responses.pop(0)
 
 
-def groq(model: str = "llama-3.3-70b-versatile") -> OpenAICompatClient:
+def groq(model: str = "openai/gpt-oss-120b") -> OpenAICompatClient:
     key = os.environ.get("GROQ_API_KEY")
     if not key:
         raise LLMError("GROQ_API_KEY not set")
@@ -111,13 +192,13 @@ def ollama(model: str = "llama3.1:8b") -> OpenAICompatClient:
 
 def build_llm(provider: str) -> LLM:
     if provider == "groq":
-        return groq(os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"))
+        return groq(os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"))
     if provider == "ollama":
         return ollama(os.environ.get("OLLAMA_MODEL", "llama3.1:8b"))
     if provider == "auto":
         chain: list[LLM] = []
         if os.environ.get("GROQ_API_KEY"):
-            chain.append(groq(os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")))
+            chain.append(groq(os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")))
         chain.append(ollama(os.environ.get("OLLAMA_MODEL", "llama3.1:8b")))
         return FallbackLLM(chain)
     if provider == "mock":
@@ -159,7 +240,7 @@ def extract_json(text: str) -> Any:
 
 
 def call_json(llm: LLM, messages: list[Message], validate: Callable[[Any], str | None],
-              retries: int = 2, on_call: Callable[[], None] | None = None) -> Any:
+              retries: int = 2, on_call: Callable[[], None] | None = None, **kw: Any) -> Any:
     """Call the model and return validated JSON.
 
     `validate(obj)` returns None when valid or an error string, which is fed
@@ -170,7 +251,7 @@ def call_json(llm: LLM, messages: list[Message], validate: Callable[[Any], str |
     for _ in range(retries + 1):
         if on_call:
             on_call()
-        raw = llm.complete(convo)
+        raw = llm.complete(convo, **kw)
         try:
             obj = extract_json(raw)
             err = validate(obj)
