@@ -13,6 +13,8 @@ Success for a task (all must hold):
   - every `include_any` group has at least one string in the final answer
   - no `exclude` string appears in the final answer
   - `abstain` tasks contain zero supported factual claims; others contain >= 1
+    unless `abstain_ok` (e.g. a required tool is down, so abstaining is also correct)
+  - `exclude` strings are checked in factual sentences only, not in abstentions
   - every tool in `cite_tools` backs at least one kept claim
   - zero unsupported claims in the shipped answer (re-checked independently)
 """
@@ -81,12 +83,15 @@ def score(task: dict[str, Any], state: RunState, latency: float) -> TaskResult:
     for group in exp.get("include_any", []):
         if not any(g.lower() in low for g in group):
             fails.append(f"missing one of {group}")
+    # forbidden content is checked in factual sentences only: a refusal such as
+    # "Insufficient evidence: ... whether you should buy" must not count as advice
+    factual_text = " ".join(c.text for c in factual).lower()
     for bad in exp.get("exclude", []):
-        if bad.lower() in low:
+        if bad.lower() in factual_text:
             fails.append(f"contains forbidden '{bad}'")
     if exp.get("abstain") and supported:
         fails.append("should have abstained but made factual claims")
-    if not exp.get("abstain") and not supported:
+    if not exp.get("abstain") and not exp.get("abstain_ok") and not supported:
         fails.append("no supported factual claim")
     for tool in exp.get("cite_tools", []):
         if not any(state.evidence[c].tool == tool for s in supported for c in s.citations):

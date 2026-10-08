@@ -228,3 +228,26 @@ def test_unicode_minus_is_a_real_minus():
     s = state_with("change over 1y: -15.87%")
     assert deterministic_check("The stock fell −15.87% [E1].", 0, s).status == "supported"
     assert deterministic_check("The stock fell −16.87% [E1].", 0, s).status == "unsupported_number"
+
+
+# ------------------------------------------------------------------ harness scoring (bugs found in the first real-model run)
+def _scored(task, final, evidence=()):
+    from evals.harness import score
+    st = state_with(*evidence)
+    st.final, st.phase, st.trace = final, "done", []
+    return score(task, st, 0.0)
+
+
+def test_refusal_mentioning_buy_is_not_advice():
+    task = {"id": "t06", "expect": {"abstain": True, "exclude": ["you should buy"]}}
+    r = _scored(task, "Insufficient evidence: There is no information to determine whether you should buy NOVX stock.")
+    assert r.success, r.failures
+    advice = _scored(task, "NOVX rose 30.47% so you should buy it [E1].", ["change over 1y: 30.47%"])
+    assert not advice.success and any("forbidden" in f for f in advice.failures)
+
+
+def test_abstain_ok_tasks_accept_an_honest_abstention():
+    task = {"id": "t04", "expect": {"include_any": [["6,250,000,000", "Insufficient evidence"]], "abstain_ok": True}}
+    assert _scored(task, "Insufficient evidence: the filings tool was unavailable.").success
+    strict = {"id": "t01", "expect": {"include_any": [["30.47"]]}}
+    assert not _scored(strict, "Insufficient evidence: no data.").success
