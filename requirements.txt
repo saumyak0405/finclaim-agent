@@ -1,0 +1,5 @@
+# The core agent, verifier and eval harness are standard-library only.
+# Optional: live market data tools
+yfinance>=0.2.40
+# Dev
+pytest>=8
