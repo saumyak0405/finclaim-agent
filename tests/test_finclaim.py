@@ -196,3 +196,35 @@ def test_state_round_trips_through_json():
     s.plan = [Step(1, "g")]
     back = RunState.from_json(s.to_json())
     assert back.evidence["E1"].tainted and back.plan[0].goal == "g"
+
+
+# ------------------------------------------------------------------ real model typography (gpt-oss on Groq)
+GPT_OSS_DRAFT = ("NOVX closed at $412.50 on 2025‑10‑01 and $538.20 on 2026‑09‑30, a gain of 30.47% "
+                 "over the year [E1]. Its price during that period ranged from a low of $398.10 to a high of $561.00 [E1].")
+GPT_OSS_REPAIR = GPT_OSS_DRAFT.replace(" [E1].", "【E1】.")
+PRICES = "NOVX close 2025-10-01: 412.50; close 2026-09-30: 538.20; change over 1y: 30.47%; high 561.00; low 398.10"
+
+
+@pytest.mark.parametrize("answer", [GPT_OSS_DRAFT, GPT_OSS_REPAIR], ids=["non-breaking-hyphen-dates", "fullwidth-citations"])
+def test_real_gpt_oss_drafts_verify(answer):
+    s = state_with(PRICES)
+    results = [deterministic_check(c, i, s) for i, c in enumerate(split_claims(answer))]
+    assert [r.status for r in results] == ["supported", "supported"], [(r.status, r.reason) for r in results]
+
+
+@pytest.mark.parametrize("claim", [
+    "Revenue was 18.4 billion. [E1]",            # citation after the full stop
+    "Revenue was 18.4 billion [E1, E2].",        # list citation
+    "Revenue was 18.4 billion 【E1†L1-L3】.",  # native gpt-oss style with line refs
+])
+def test_citation_styles(claim):
+    s = state_with("totalRevenue: 18,400,000,000", "other")
+    claims = split_claims(claim)
+    assert len(claims) == 1
+    assert deterministic_check(claims[0], 0, s).status == "supported"
+
+
+def test_unicode_minus_is_a_real_minus():
+    s = state_with("change over 1y: -15.87%")
+    assert deterministic_check("The stock fell −15.87% [E1].", 0, s).status == "supported"
+    assert deterministic_check("The stock fell −16.87% [E1].", 0, s).status == "unsupported_number"

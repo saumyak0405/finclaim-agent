@@ -28,7 +28,29 @@ EXEMPT = "exempt"
 FAIL_LABELS = {"missing_citation", "bad_citation", "tainted_citation", "unsupported_number",
                "contradicted", "not_enough_info"}
 
-_CITE = re.compile(r"\[(E\d+)\]")
+# A citation group: [E1], [E1, E3], or a model's native style after normalisation, e.g. [E1†L1-L3]
+_CITE_GROUP = re.compile(r"\[\s*(E\d+[^\]\[]{0,40})\]")
+_DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"), "-")
+_SPACES = dict.fromkeys(map(ord, "\u00a0\u202f\u2009\u2007"), " ")
+
+
+def normalize(text: str) -> str:
+    """Map model typography to plain ASCII before any check: non-breaking / en / em dashes and
+    the minus sign become '-', exotic spaces become ' ', fullwidth brackets 【】 become []."""
+    return text.translate(_DASHES).translate(_SPACES).replace("\u3010", "[").replace("\u3011", "]")
+
+
+def citations_of(text: str) -> list[str]:
+    out: list[str] = []
+    for group in _CITE_GROUP.findall(text):
+        for c in re.findall(r"E\d+", group):
+            if c not in out:
+                out.append(c)
+    return out
+
+
+def strip_citations(text: str) -> str:
+    return _CITE_GROUP.sub("", text)
 _EXEMPT_PREFIX = re.compile(
     r"^(insufficient evidence|not enough|i could not|i couldn't|no (data|evidence)|note:|disclaimer|"
     r"this is not (investment|financial) advice|removed \d+ claim)", re.I)
@@ -54,9 +76,15 @@ class ClaimResult:
 
 
 def split_claims(answer: str) -> list[str]:
-    text = re.sub(r"^\s*[-*•]\s*", "", answer, flags=re.M)
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z\"(])|\n+", text)
-    return [p.strip() for p in parts if p and len(p.strip()) > 2]
+    text = re.sub(r"^\s*[-*•]\s*", "", normalize(answer), flags=re.M)
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+(?=[A-Z\"(\[])|\n+", text) if p and p.strip()]
+    claims: list[str] = []
+    for p in parts:
+        if claims and not strip_citations(p).strip(" .;,"):
+            claims[-1] = claims[-1] + " " + p  # a citation placed after the full stop belongs to the previous claim
+        elif len(p) > 2:
+            claims.append(p)
+    return claims
 
 
 def parse_numbers(text: str) -> list[float]:
@@ -77,10 +105,11 @@ def parse_numbers(text: str) -> list[float]:
 
 
 def _claim_numbers(claim: str) -> list[float]:
-    body = _CITE.sub("", claim)
-    # ignore bare years and fiscal-year labels: they identify, they don't assert
+    body = strip_citations(normalize(claim))
+    # dates and years identify, they don't assert. Dates must go first: removing the year
+    # first would leave '-10-01' behind to be read as the numbers 10 and 1.
+    body = re.sub(r"\b\d{4}-\d{1,2}-\d{1,2}\b", "", body)
     body = re.sub(r"\b(?:FY|Q[1-4]\s*)?(19|20)\d{2}\b", "", body)
-    body = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", body)
     return parse_numbers(body)
 
 
@@ -94,8 +123,9 @@ def _matches(value: float, pool: list[float], rel: float = 0.005) -> bool:
 
 
 def deterministic_check(claim: str, i: int, state: RunState) -> ClaimResult:
-    cites = _CITE.findall(claim)
-    stripped = _CITE.sub("", claim).strip()
+    claim = normalize(claim)
+    cites = citations_of(claim)
+    stripped = strip_citations(claim).strip()
     if _EXEMPT_PREFIX.match(stripped):
         return ClaimResult(i, claim, cites, EXEMPT, "abstention/meta sentence")
     if not cites:
@@ -108,7 +138,7 @@ def deterministic_check(claim: str, i: int, state: RunState) -> ClaimResult:
         return ClaimResult(i, claim, cites, "tainted_citation", f"cites injection-flagged evidence {tainted}")
     pool: list[float] = []
     for c in cites:
-        pool += parse_numbers(state.evidence[c].text)
+        pool += parse_numbers(normalize(state.evidence[c].text))
     bad = [n for n in _claim_numbers(claim) if not _matches(n, pool)]
     if bad:
         return ClaimResult(i, claim, cites, "unsupported_number",

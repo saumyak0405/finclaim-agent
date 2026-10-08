@@ -50,7 +50,7 @@ Working memory:
 WRITER = """ROLE: writer
 Write a concise research answer using ONLY the evidence below.
 Rules:
-- One factual claim per sentence. End every factual sentence with its citation(s), e.g. [E2] or [E1][E3].
+- One factual claim per sentence. End every factual sentence with its citation(s) in plain square brackets, e.g. [E2] or [E1][E3].
 - Copy numbers exactly as they appear in the evidence, or cite a calculate() result for derived numbers.
 - If something the question asks for is not in the evidence, write a sentence starting with
   "Insufficient evidence:" instead of guessing.
